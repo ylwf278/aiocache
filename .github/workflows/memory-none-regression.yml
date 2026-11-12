@@ -1,0 +1,68 @@
+name: Memory None deletion regression evidence
+on:
+  push:
+    branches: ['ci/memory-none-1096']
+    paths: ['.github/workflows/memory-none-regression.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: a4facf1001bb2510fc4ed846716de07888c891f1
+          fetch-depth: 2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r requirements.txt ruff==0.17.4
+      - name: Verify fixed memory backend suite
+        shell: bash
+        run: |
+          mkdir -p evidence
+          python -m pytest tests/ut/backends/test_memory.py -q --no-cov --junitxml=evidence/after.xml 2>&1 | tee evidence/after.log
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('evidence/after.xml').getroot()
+          cases = list(root.iter('testcase'))
+          assert len(cases) == 49
+          assert not any(c.find('failure') is not None or c.find('error') is not None or c.find('skipped') is not None for c in cases)
+          print('FIXED_MEMORY_SUITE: 49 passed, no failures/errors/skips')
+          PY
+      - name: Confirm expected None and expiry regressions on original implementation
+        shell: bash
+        run: |
+          trap 'git restore aiocache/backends/memory.py' EXIT
+          git restore --source=ae5948b2d99dcaa68fe02fd3086a3351a867c85b aiocache/backends/memory.py
+          set +e
+          python -m pytest tests/ut/backends/test_memory.py -q --no-cov -k 'delete_falsy_value_cleans_up_ttl or expiring_none_cleans_up_handler' --junitxml=evidence/before.xml > evidence/before.log 2>&1
+          result=$?
+          set -e
+          cat evidence/before.log
+          test "$result" -eq 1
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse('evidence/before.xml').iter('testcase'))
+          assert len(cases) == 5
+          failed = {c.attrib['name'] for c in cases if c.find('failure') is not None}
+          assert failed == {'test_delete_falsy_value_cleans_up_ttl[None]', 'test_expiring_none_cleans_up_handler'}
+          assert not any(c.find('error') is not None or c.find('skipped') is not None for c in cases)
+          print('BASELINE_REGRESSION: 2 expected failures, 3 falsy-value controls passed')
+          PY
+      - name: Check changed files
+        shell: bash
+        run: |
+          python -m ruff check --select E9,F aiocache/backends/memory.py tests/ut/backends/test_memory.py 2>&1 | tee evidence/ruff.log
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: memory-none-python-${{ matrix.python }}
+          path: evidence/
